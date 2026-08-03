@@ -1,0 +1,186 @@
+name: frontend-visual-evidence
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+jobs:
+  visual:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    env:
+      EFHC_E2E_BASE_URL: http://127.0.0.1:3000
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_PYTHON_VERSION_WARNING: "1"
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Init visual artifacts
+        run: |
+          rm -rf ci_artifacts extracted
+          mkdir -p ci_artifacts
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Versions
+        run: |
+          {
+            echo "ref=$GITHUB_REF"
+            echo "sha=$GITHUB_SHA"
+            python -V
+            python -m pip -V
+            node -v
+            npm -v
+          } | tee ci_artifacts/01_versions.txt
+
+      - name: Ensure efhc.zip
+        run: |
+          test -f efhc.zip || \
+            (echo "ERROR: efhc.zip missing" && exit 1)
+          ls -la efhc.zip | tee ci_artifacts/02_efhc_zip_ls.txt
+          sha256sum efhc.zip | tee ci_artifacts/03_efhc_zip_sha256.txt
+
+      - name: Unzip efhc.zip
+        run: |
+          mkdir -p extracted
+          unzip -q efhc.zip -d extracted
+          find extracted -maxdepth 12 -name ".npmrc" \
+            -print -delete || true
+          test -d extracted/frontend || \
+            (echo "ERROR: extracted/frontend missing" && exit 1)
+          test -f extracted/frontend/package-lock.json || exit 1
+          test -f extracted/requirements-visual.txt || exit 1
+          test -f \
+            extracted/ops/frontend/all_pages_route_backed_visual_audit.py \
+            || exit 1
+
+      - name: Install visual dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            -r extracted/requirements-visual.txt \
+            2>&1 | tee ci_artifacts/04_visual_deps.txt
+          python -m playwright install --with-deps chromium \
+            2>&1 | tee ci_artifacts/05_chromium_install.txt
+
+      - name: Build exact frontend
+        env:
+          NEXT_PUBLIC_ADMIN_TG_IDS: "1"
+        run: |
+          if grep -RInE \
+            "applied-caas-gateway|internal\.api\.openai|artifactory" \
+            extracted/frontend/package-lock.json; then
+            echo "ERROR: forbidden registry markers"
+            exit 1
+          fi
+
+          cd extracted/frontend
+          npm config set registry https://registry.npmjs.org/
+          npm ci --no-audit --no-fund --progress=false \
+            2>&1 | tee ../../ci_artifacts/06_npm_ci.txt
+          npm run build \
+            2>&1 | tee ../../ci_artifacts/07_npm_build.txt
+
+      - name: Chromium visual audit
+        env:
+          NEXT_PUBLIC_ADMIN_TG_IDS: "1"
+        run: |
+          ec=0
+          server_pid=""
+          visual_marker="$PWD/ci_artifacts/08_visual_started.marker"
+          touch "$visual_marker"
+
+          finish() {
+            if test -n "$server_pid"; then
+              kill "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            fi
+          }
+          trap finish EXIT
+
+          (
+            cd extracted/frontend
+            npm run start -- --hostname 127.0.0.1 \
+              > ../../ci_artifacts/09_frontend_server.txt 2>&1
+          ) &
+          server_pid=$!
+
+          python - <<'PYWAIT' \
+            2>&1 | tee ci_artifacts/10_frontend_ready.txt
+          import time
+          import urllib.request
+
+          url = "http://127.0.0.1:3000/"
+          for attempt in range(1, 61):
+              try:
+                  with urllib.request.urlopen(url, timeout=2) as response:
+                      print(
+                          "OK: frontend ready "
+                          f"attempt={attempt} status={response.status}"
+                      )
+                  break
+              except Exception as exc:
+                  print(
+                      "WAIT: frontend not ready "
+                      f"attempt={attempt} error={exc}"
+                  )
+                  time.sleep(1)
+          else:
+              raise SystemExit("frontend server did not become ready")
+          PYWAIT
+
+          cd extracted
+          python ops/frontend/all_pages_route_backed_visual_audit.py \
+            --base-url http://127.0.0.1:3000 \
+            2>&1 | tee ../ci_artifacts/11_chromium_visual_audit.txt
+          ec=${PIPESTATUS[0]}
+          cd ..
+
+          mkdir -p ci_artifacts/12_chromium_evidence
+          evidence_count=0
+          while IFS= read -r -d '' evidence_file; do
+            cp --parents "$evidence_file" \
+              ci_artifacts/12_chromium_evidence
+            evidence_count=$((evidence_count + 1))
+          done < <(
+            find \
+              extracted/reports/generated \
+              extracted/reports/screenshots \
+              -type f -newer "$visual_marker" -print0 \
+              2>/dev/null
+          )
+
+          echo "visual_evidence_files=$evidence_count" \
+            | tee ci_artifacts/13_chromium_evidence_count.txt
+
+          if test "$ec" = "0" && test "$evidence_count" = "0"; then
+            echo "ERROR: Chromium audit produced no fresh evidence"
+            ec=87
+          fi
+
+          echo "$ec" > ci_artifacts/exit_chromium_visual.txt
+          exit "$ec"
+
+      - name: Upload visual evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-visual-evidence-${{ github.run_id }}
+          path: ci_artifacts
+          if-no-files-found: warn
+          retention-days: 14
