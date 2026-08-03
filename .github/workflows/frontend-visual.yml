@@ -1,0 +1,599 @@
+name: frontend-visual-evidence
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+jobs:
+  screenshots:
+    name: Capture 102 frontend screenshots
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      EFHC_E2E_BASE_URL: http://127.0.0.1:3000
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_PYTHON_VERSION_WARNING: "1"
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      NEXT_PUBLIC_ADMIN_TG_IDS: "1"
+      NEXT_PUBLIC_EFHC_ADMIN_VISUAL_PROOF: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Initialize artifacts
+        run: |
+          rm -rf extracted ci_artifacts
+          mkdir -p ci_artifacts/screenshots
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Extract application archive
+        run: |
+          test -f efhc.zip || {
+            echo "ERROR: efhc.zip is missing"
+            exit 1
+          }
+
+          sha256sum efhc.zip | tee ci_artifacts/efhc_zip_sha256.txt
+          unzip -q efhc.zip -d extracted
+
+          find extracted -maxdepth 12 -name ".npmrc" -print -delete || true
+
+          test -d extracted/frontend || {
+            echo "ERROR: extracted/frontend is missing"
+            exit 1
+          }
+          test -f extracted/frontend/package-lock.json || {
+            echo "ERROR: frontend/package-lock.json is missing"
+            exit 1
+          }
+          test -f extracted/requirements-visual.txt || {
+            echo "ERROR: requirements-visual.txt is missing"
+            exit 1
+          }
+          test -f extracted/ops/frontend/all_pages_visual_manifest_v171_88.json || {
+            echo "ERROR: visual manifest is missing"
+            exit 1
+          }
+
+      - name: Create clean screenshot runner
+        run: |
+          mkdir -p .github/scripts
+          cat > .github/scripts/efhc_capture_screenshots.py <<'PYCODE'
+          from __future__ import annotations
+
+          import argparse
+          import json
+          import struct
+          import time
+          from pathlib import Path
+          from typing import Any
+
+          from playwright.sync_api import Browser, Page, TimeoutError, sync_playwright
+
+
+          EXPECTED_SCREENSHOTS = 102
+          NAVIGATION_TIMEOUT_MS = 120_000
+          READY_TIMEOUT_MS = 45_000
+          DEFAULT_ACTION_TIMEOUT_MS = 60_000
+          FONT_TIMEOUT_MS = 30_000
+          SCREENSHOT_TIMEOUT_MS = 120_000
+
+
+          def slug(route: str) -> str:
+              value = route.strip("/").replace("/", "__")
+              return value or "root"
+
+
+          def validate_png(path: Path, width: int, height: int) -> int:
+              data = path.read_bytes()
+              if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+                  raise RuntimeError(f"invalid PNG: {path}")
+
+              actual_width, actual_height = struct.unpack(">II", data[16:24])
+              if (actual_width, actual_height) != (width, height):
+                  raise RuntimeError(
+                      "wrong PNG dimensions: "
+                      f"{path}={actual_width}x{actual_height}, "
+                      f"expected={width}x{height}"
+                  )
+              return len(data)
+
+
+          def wait_until_ready(page: Page, marker: str) -> list[str]:
+              warnings: list[str] = []
+
+              if marker:
+                  try:
+                      page.wait_for_function(
+                          """
+                          marker => {
+                            const shellReady =
+                              document.documentElement.dataset.efhcShell === 'ready';
+                            let markerReady = false;
+                            try {
+                              markerReady = Boolean(document.querySelector(marker));
+                            } catch (_) {
+                              markerReady = false;
+                            }
+                            return document.readyState !== 'loading'
+                              && shellReady
+                              && markerReady;
+                          }
+                          """,
+                          arg=marker,
+                          timeout=READY_TIMEOUT_MS,
+                      )
+                  except TimeoutError:
+                      warnings.append(
+                          "shell/marker readiness timeout; screenshot captured anyway"
+                      )
+              else:
+                  warnings.append("manifest marker is empty")
+
+              try:
+                  page.evaluate(
+                      """
+                      async timeoutMs => {
+                        if (!document.fonts) return 'unsupported';
+                        return await Promise.race([
+                          document.fonts.ready.then(() => document.fonts.status),
+                          new Promise(resolve =>
+                            setTimeout(() => resolve('timeout'), timeoutMs)
+                          ),
+                        ]);
+                      }
+                      """,
+                      FONT_TIMEOUT_MS,
+                  )
+              except Exception as exc:  # screenshot must still be attempted
+                  warnings.append(
+                      f"font readiness warning: {type(exc).__name__}: {exc}"
+                  )
+
+              page.wait_for_timeout(500)
+              return warnings
+
+
+          def capture_one(
+              browser: Browser,
+              *,
+              base_url: str,
+              output_dir: Path,
+              kind: str,
+              item: dict[str, Any],
+              viewport: dict[str, Any],
+          ) -> dict[str, Any]:
+              route = str(item["route"])
+              marker = str(item.get("marker") or "")
+              width = int(viewport["width"])
+              height = int(viewport["height"])
+              viewport_name = str(viewport.get("name") or f"{width}x{height}")
+              expected_status = int(item.get("expected_status", 200))
+
+              shot = output_dir / f"{kind}__{slug(route)}__{width}x{height}.png"
+              shot.parent.mkdir(parents=True, exist_ok=True)
+              shot.unlink(missing_ok=True)
+
+              result: dict[str, Any] = {
+                  "kind": kind,
+                  "route": route,
+                  "viewport": {
+                      "name": viewport_name,
+                      "width": width,
+                      "height": height,
+                  },
+                  "marker": marker,
+                  "expected_http_status": expected_status,
+                  "http_status": None,
+                  "screenshot": str(shot),
+                  "screenshot_created": False,
+                  "screenshot_bytes": 0,
+                  "warnings": [],
+                  "error": None,
+                  "seconds": 0.0,
+              }
+
+              started = time.monotonic()
+              context = browser.new_context(
+                  viewport={"width": width, "height": height},
+                  device_scale_factor=1,
+                  service_workers="block",
+                  reduced_motion="reduce",
+                  color_scheme="dark",
+                  locale="ru-RU",
+                  ignore_https_errors=True,
+              )
+              page = context.new_page()
+              page.set_default_timeout(DEFAULT_ACTION_TIMEOUT_MS)
+              page.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
+
+              if kind == "admin":
+                  page.add_init_script(
+                      script=(
+                          "window.__EFHC_ADMIN_PROOF_PATH__ = "
+                          f"{json.dumps(route)};"
+                      )
+                  )
+
+              try:
+                  url = f"{base_url}{route}"
+                  print(
+                      f"[route-start] {kind} {route} {width}x{height}",
+                      flush=True,
+                  )
+
+                  try:
+                      response = page.goto(
+                          url,
+                          wait_until="domcontentloaded",
+                          timeout=NAVIGATION_TIMEOUT_MS,
+                      )
+                      if response is not None:
+                          result["http_status"] = response.status
+                      print(
+                          f"[navigation-done] {kind} {route} "
+                          f"status={result['http_status']}",
+                          flush=True,
+                      )
+                  except TimeoutError:
+                      result["warnings"].append(
+                          "navigation timeout; screenshot captured from current page state"
+                      )
+                      print(
+                          f"[navigation-timeout] {kind} {route}",
+                          flush=True,
+                      )
+                  except Exception as exc:
+                      result["warnings"].append(
+                          f"navigation warning: {type(exc).__name__}: {exc}"
+                      )
+                      print(
+                          f"[navigation-warning] {kind} {route}: {exc}",
+                          flush=True,
+                      )
+
+                  result["warnings"].extend(wait_until_ready(page, marker))
+
+                  print(
+                      f"[capture-start] {kind} {route} {width}x{height}",
+                      flush=True,
+                  )
+                  page.screenshot(
+                      path=str(shot),
+                      full_page=False,
+                      animations="disabled",
+                      caret="hide",
+                      timeout=SCREENSHOT_TIMEOUT_MS,
+                  )
+                  result["screenshot_bytes"] = validate_png(shot, width, height)
+                  result["screenshot_created"] = True
+                  print(
+                      f"[capture-done] {kind} {route} {width}x{height} "
+                      f"bytes={result['screenshot_bytes']}",
+                      flush=True,
+                  )
+              except Exception as exc:
+                  result["error"] = f"{type(exc).__name__}: {exc}"
+                  shot.unlink(missing_ok=True)
+                  print(
+                      f"[route-fail] {kind} {route} {width}x{height}: "
+                      f"{result['error']}",
+                      flush=True,
+                  )
+              finally:
+                  result["seconds"] = round(time.monotonic() - started, 3)
+                  context.close()
+
+              return result
+
+
+          def write_report(
+              path: Path,
+              *,
+              base_url: str,
+              routes: int,
+              viewports: int,
+              results: list[dict[str, Any]],
+              started: float,
+              complete: bool,
+          ) -> dict[str, Any]:
+              created = sum(
+                  1 for result in results if result["screenshot_created"]
+              )
+              errors = sum(1 for result in results if result["error"])
+              warnings = sum(len(result["warnings"]) for result in results)
+
+              report = {
+                  "schema": "EFHC_VIEWPORT_SCREENSHOTS_V3",
+                  "purpose": "fresh viewport PNG only",
+                  "deep_e2e_audit": False,
+                  "browser": "playwright-managed chromium",
+                  "document_loader": "page.goto",
+                  "request_interception": False,
+                  "legacy_helper_imports": False,
+                  "full_page": False,
+                  "base_url": base_url,
+                  "routes": routes,
+                  "viewports": viewports,
+                  "screenshots_expected": EXPECTED_SCREENSHOTS,
+                  "screenshots_attempted": len(results),
+                  "screenshots_created": created,
+                  "errors": errors,
+                  "warnings": warnings,
+                  "complete": complete,
+                  "status": (
+                      "PASSED"
+                      if complete
+                      and created == EXPECTED_SCREENSHOTS
+                      and errors == 0
+                      else "FAILED"
+                  ),
+                  "total_seconds": round(time.monotonic() - started, 3),
+                  "results": results,
+              }
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(
+                  json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+                  encoding="utf-8",
+              )
+              return report
+
+
+          def run(
+              *,
+              project_root: Path,
+              base_url: str,
+              output_dir: Path,
+              report_path: Path,
+          ) -> None:
+              manifest_path = (
+                  project_root
+                  / "ops/frontend/all_pages_visual_manifest_v171_88.json"
+              )
+              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+              public_items = (
+                  list(manifest["public_routes"])
+                  + list(manifest["system_routes"])
+              )
+              admin_items = list(manifest["admin_routes"])
+              viewports = list(manifest["viewports"])
+              routes = len(public_items) + len(admin_items)
+              expected_from_manifest = routes * len(viewports)
+
+              if expected_from_manifest != EXPECTED_SCREENSHOTS:
+                  raise SystemExit(
+                      "ERROR: visual manifest changed: "
+                      f"routes={routes}, viewports={len(viewports)}, "
+                      f"expected={expected_from_manifest}, "
+                      f"required={EXPECTED_SCREENSHOTS}"
+                  )
+
+              output_dir.mkdir(parents=True, exist_ok=True)
+              for old_png in output_dir.glob("*.png"):
+                  old_png.unlink()
+
+              base_url = base_url.rstrip("/")
+              results: list[dict[str, Any]] = []
+              started = time.monotonic()
+
+              with sync_playwright() as playwright:
+                  browser = playwright.chromium.launch(
+                      headless=True,
+                      chromium_sandbox=False,
+                      args=[
+                          "--disable-dev-shm-usage",
+                          "--no-sandbox",
+                      ],
+                  )
+                  try:
+                      for viewport in viewports:
+                          for item in public_items:
+                              results.append(
+                                  capture_one(
+                                      browser,
+                                      base_url=base_url,
+                                      output_dir=output_dir,
+                                      kind="public",
+                                      item=item,
+                                      viewport=viewport,
+                                  )
+                              )
+                              write_report(
+                                  report_path,
+                                  base_url=base_url,
+                                  routes=routes,
+                                  viewports=len(viewports),
+                                  results=results,
+                                  started=started,
+                                  complete=False,
+                              )
+
+                          for item in admin_items:
+                              results.append(
+                                  capture_one(
+                                      browser,
+                                      base_url=base_url,
+                                      output_dir=output_dir,
+                                      kind="admin",
+                                      item=item,
+                                      viewport=viewport,
+                                  )
+                              )
+                              write_report(
+                                  report_path,
+                                  base_url=base_url,
+                                  routes=routes,
+                                  viewports=len(viewports),
+                                  results=results,
+                                  started=started,
+                                  complete=False,
+                              )
+                  finally:
+                      browser.close()
+
+              report = write_report(
+                  report_path,
+                  base_url=base_url,
+                  routes=routes,
+                  viewports=len(viewports),
+                  results=results,
+                  started=started,
+                  complete=True,
+              )
+
+              print(
+                  json.dumps(
+                      {
+                          "status": report["status"],
+                          "screenshots_created": report["screenshots_created"],
+                          "screenshots_expected": report["screenshots_expected"],
+                          "errors": report["errors"],
+                          "warnings": report["warnings"],
+                          "total_seconds": report["total_seconds"],
+                          "report": str(report_path),
+                      },
+                      ensure_ascii=False,
+                      indent=2,
+                  ),
+                  flush=True,
+              )
+
+              if report["status"] != "PASSED":
+                  raise SystemExit(1)
+
+
+          def main() -> None:
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--project-root", default="extracted")
+              parser.add_argument(
+                  "--base-url",
+                  default="http://127.0.0.1:3000",
+              )
+              parser.add_argument(
+                  "--output-dir",
+                  default="ci_artifacts/screenshots",
+              )
+              parser.add_argument(
+                  "--report",
+                  default="ci_artifacts/screenshots_report.json",
+              )
+              args = parser.parse_args()
+
+              run(
+                  project_root=Path(args.project_root).resolve(),
+                  base_url=args.base_url,
+                  output_dir=Path(args.output_dir).resolve(),
+                  report_path=Path(args.report).resolve(),
+              )
+
+
+          if __name__ == "__main__":
+              main()
+          PYCODE
+
+          python -m py_compile .github/scripts/efhc_capture_screenshots.py
+
+      - name: Install frontend and browser dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r extracted/requirements-visual.txt
+          python -m playwright install --with-deps chromium
+
+          cd extracted/frontend
+          npm config set registry https://registry.npmjs.org/
+          npm ci --no-audit --no-fund --progress=false
+
+      - name: Build exact frontend
+        working-directory: extracted/frontend
+        run: npm run build
+
+      - name: Capture 102 fresh viewport PNG
+        run: |
+          server_pid=""
+
+          finish() {
+            if test -n "$server_pid"; then
+              kill -TERM -- "-$server_pid" 2>/dev/null || true
+              sleep 2
+              kill -KILL -- "-$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            fi
+          }
+          trap finish EXIT
+
+          setsid bash -c '
+            cd extracted/frontend
+            exec npm run start -- --hostname 127.0.0.1
+          ' > ci_artifacts/frontend_server.txt 2>&1 &
+          server_pid=$!
+
+          ready="false"
+          for attempt in $(seq 1 240); do
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              echo "ERROR: frontend server stopped before readiness"
+              tail -n 200 ci_artifacts/frontend_server.txt || true
+              exit 1
+            fi
+
+            if curl --fail --silent --show-error \
+              "$EFHC_E2E_BASE_URL/" >/dev/null; then
+              ready="true"
+              break
+            fi
+
+            echo "WAIT: frontend not ready ($attempt/240)"
+            sleep 1
+          done
+
+          if test "$ready" != "true"; then
+            echo "ERROR: frontend did not become ready within 240 seconds"
+            tail -n 200 ci_artifacts/frontend_server.txt || true
+            exit 1
+          fi
+          echo "OK: frontend ready"
+
+          timeout --signal=TERM --kill-after=30s 55m \
+            python -u .github/scripts/efhc_capture_screenshots.py \
+              --project-root extracted \
+              --base-url "$EFHC_E2E_BASE_URL" \
+              --output-dir ci_artifacts/screenshots \
+              --report ci_artifacts/screenshots_report.json \
+            2>&1 | tee ci_artifacts/screenshots_run.txt
+
+          count="$(find ci_artifacts/screenshots -type f -name '*.png' | wc -l)"
+          echo "screenshots=$count" | tee ci_artifacts/screenshots_count.txt
+
+          test "$count" = "102" || {
+            echo "ERROR: expected 102 PNG, created $count"
+            exit 1
+          }
+
+      - name: Upload visual evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-visual-evidence-${{ github.run_id }}
+          path: ci_artifacts
+          if-no-files-found: error
+          retention-days: 14
