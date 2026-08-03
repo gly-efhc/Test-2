@@ -1,0 +1,535 @@
+name: canon
+
+on:
+  push:
+    paths:
+      - "efhc.zip"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/canon.yml"
+  pull_request:
+    paths:
+      - "efhc.zip"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/canon.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: canon-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+jobs:
+  canon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: efhc_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d efhc_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+
+    env:
+      DB_SCHEMA_CORE: efhc_core
+      DB_SCHEMA_ADMIN: efhc_admin
+
+      DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
+      SYNC_DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
+      ASYNC_DATABASE_URL: >-
+        postgresql+asyncpg://postgres:postgres@localhost:5432/efhc_test
+
+      PSYCOPG_URL: postgresql://postgres:postgres@localhost:5432/efhc_test
+
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_PYTHON_VERSION_WARNING: "1"
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Init artifacts
+        run: |
+          rm -rf ci_artifacts extracted
+          mkdir -p ci_artifacts
+
+      - name: Ensure efhc.zip
+        run: |
+          test -f efhc.zip || \
+            (echo "ERROR: efhc.zip missing" && exit 1)
+          ls -la efhc.zip | tee ci_artifacts/03_efhc_zip_ls.txt
+          sha256sum efhc.zip | tee ci_artifacts/03_efhc_zip_sha256.txt
+
+      - name: Unzip efhc.zip
+        run: |
+          mkdir -p extracted
+          unzip -q efhc.zip -d extracted
+          find extracted -maxdepth 12 -name ".npmrc" \
+            -print -delete || true
+          test -d extracted/backend || \
+            (echo "ERROR: extracted/backend missing" && exit 1)
+          test -f extracted/backend/alembic.ini || exit 1
+          test -f extracted/backend/requirements.txt || exit 1
+          test -f extracted/requirements-test.txt || exit 1
+          test -f extracted/frontend/package-lock.json || exit 1
+          test -f extracted/requirements-visual.txt || exit 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            extracted/backend/requirements.txt
+            extracted/requirements-test.txt
+            extracted/requirements-visual.txt
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: extracted/frontend/package-lock.json
+
+      - name: Versions
+        run: |
+          {
+            echo "ref=$GITHUB_REF"
+            echo "sha=$GITHUB_SHA"
+            python -V
+            python -m pip -V
+            node -v
+            npm -v
+          } | tee ci_artifacts/01_versions.txt
+
+      - name: Guard DB profile
+        run: |
+          python - <<'PY' | tee ci_artifacts/02_db_guard.txt
+          import os
+          import sys
+
+          url = os.environ.get("DATABASE_URL", "")
+          if not url:
+              print("ERROR: DATABASE_URL empty")
+              sys.exit(2)
+          if url.lower().startswith("sqlite://"):
+              print("ERROR: sqlite forbidden")
+              sys.exit(3)
+          print("OK: postgres-only")
+          PY
+
+      - name: Install backend and quality dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r extracted/backend/requirements.txt
+          pip install -r extracted/requirements-test.txt
+
+          # Канонические инструменты проверки устанавливаются один раз.
+          pip install flake8
+          pip install ruff
+          pip install mypy
+          pip install bandit
+
+          python - <<'PY' | tee ci_artifacts/04_test_deps_sanity.txt
+          import alembic
+          import freezegun
+          import jwt
+          import psycopg
+          import pytest
+          import pytest_asyncio
+
+          print("OK: test dependency bootstrap")
+          print("pytest", pytest.__version__)
+          print("pytest_asyncio", pytest_asyncio.__version__)
+          print("freezegun", freezegun.__version__)
+          print("psycopg", psycopg.__version__)
+          print("alembic", alembic.__version__)
+          print("PyJWT", jwt.__version__)
+          PY
+
+          pip freeze | sort | tee ci_artifacts/04_pip_freeze.txt
+
+      # Gate steps: collect all failures, but do not waste Chromium time
+      # when an earlier mandatory gate is already RED.
+
+      - name: flake8 (critical)
+        continue-on-error: true
+        run: |
+          set +e
+          cd extracted
+          flake8 backend/app tests api ops \
+            --count --show-source --statistics \
+            2>&1 | tee ../ci_artifacts/04a_flake8_critical.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_flake8_critical.txt
+          exit "$ec"
+
+      - name: flake8 (full report)
+        continue-on-error: true
+        run: |
+          set +e
+          cd extracted
+          flake8 backend/app tests api ops \
+            --exit-zero --count --show-source --statistics \
+            2>&1 | tee ../ci_artifacts/04b_flake8_full.txt
+          echo "0" > ../ci_artifacts/exit_flake8_full.txt
+          exit 0
+
+      - name: ruff (full report)
+        continue-on-error: true
+        run: |
+          set +e
+          cd extracted
+          ruff check backend api ops tests \
+            2>&1 | tee ../ci_artifacts/04c_ruff_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_ruff_full.txt
+          exit "$ec"
+
+      - name: mypy (full report)
+        continue-on-error: true
+        run: |
+          set +e
+          cache_dir="$RUNNER_TEMP/efhc-mypy-cache"
+          rm -rf "$cache_dir"
+          cd extracted
+          mypy backend/app \
+            --cache-dir "$cache_dir" \
+            2>&1 | tee ../ci_artifacts/04d_mypy_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_mypy_full.txt
+          rm -rf "$cache_dir" .mypy_cache || true
+          exit "$ec"
+
+      - name: bandit (full report)
+        continue-on-error: true
+        run: |
+          set +e
+          cd extracted
+          bandit -r backend/app \
+            2>&1 | tee ../ci_artifacts/04e_bandit_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_bandit_full.txt
+          exit "$ec"
+
+      - name: compileall backend
+        continue-on-error: true
+        run: |
+          set +e
+          python -m compileall extracted/backend -q \
+            2>&1 | tee ci_artifacts/05_compileall.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ci_artifacts/exit_compileall.txt
+          exit "$ec"
+
+      - name: Install psql client only if missing
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+          fi
+          psql --version | tee ci_artifacts/06_psql_version.txt
+
+      - name: PSQL diag pre
+        continue-on-error: true
+        run: |
+          set +e
+          PGPASSWORD=postgres psql \
+            -h localhost -p 5432 -U postgres -d efhc_test \
+            -v ON_ERROR_STOP=1 \
+            -c "SELECT current_database() AS db;" \
+            -c "SHOW search_path;" \
+            -c "SELECT nspname FROM pg_namespace ORDER BY 1;" \
+            -c "SELECT count(*) AS tables FROM pg_tables;" \
+            2>&1 | tee ci_artifacts/07_psql_pre.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ci_artifacts/exit_psql_pre.txt
+          exit "$ec"
+
+      - name: Alembic upgrade head
+        continue-on-error: true
+        run: |
+          set +e
+          cd extracted/backend
+          python -m alembic -c alembic.ini upgrade head \
+            2>&1 | tee ../../ci_artifacts/08_alembic_upgrade.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../../ci_artifacts/exit_alembic_upgrade.txt
+          exit "$ec"
+
+      - name: pytest -q (collect all failures)
+        continue-on-error: true
+        timeout-minutes: 12
+        run: |
+          set +e
+          rm -rf extracted/.mypy_cache || true
+          cd extracted
+          PYTHONPATH=backend pytest -q \
+            2>&1 | tee ../ci_artifacts/12_pytest.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_pytest.txt
+          exit "$ec"
+
+      - name: Frontend build
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set +e
+          if grep -RInE \
+            "applied-caas-gateway|internal\.api\.openai|artifactory" \
+            extracted/frontend/package-lock.json; then
+            echo "ERROR: forbidden registry markers"
+            echo "91" > ci_artifacts/exit_npm_ci.txt
+            echo "91" > ci_artifacts/exit_npm_build.txt
+            exit 91
+          fi
+
+          cd extracted/frontend
+          npm config set registry https://registry.npmjs.org/
+          npm ci --no-audit --no-fund --progress=false \
+            2>&1 | tee ../../ci_artifacts/13_npm_ci.txt
+          ec_ci=${PIPESTATUS[0]}
+          echo "$ec_ci" > ../../ci_artifacts/exit_npm_ci.txt
+
+          if test "$ec_ci" != "0"; then
+            echo "SKIPPED: npm build because npm ci failed" \
+              | tee ../../ci_artifacts/14_npm_build.txt
+            echo "$ec_ci" > ../../ci_artifacts/exit_npm_build.txt
+            exit "$ec_ci"
+          fi
+
+          npm run build \
+            2>&1 | tee ../../ci_artifacts/14_npm_build.txt
+          ec_build=${PIPESTATUS[0]}
+          echo "$ec_build" > ../../ci_artifacts/exit_npm_build.txt
+          exit "$ec_build"
+
+      - name: Decide whether Chromium is allowed to run
+        id: pre_visual
+        if: always()
+        run: |
+          failed=0
+          for f in \
+            ci_artifacts/exit_flake8_critical.txt \
+            ci_artifacts/exit_ruff_full.txt \
+            ci_artifacts/exit_mypy_full.txt \
+            ci_artifacts/exit_bandit_full.txt \
+            ci_artifacts/exit_compileall.txt \
+            ci_artifacts/exit_psql_pre.txt \
+            ci_artifacts/exit_alembic_upgrade.txt \
+            ci_artifacts/exit_pytest.txt \
+            ci_artifacts/exit_npm_ci.txt \
+            ci_artifacts/exit_npm_build.txt; do
+            if ! test -f "$f"; then
+              echo "PRE-VISUAL MISS: $f"
+              failed=1
+              continue
+            fi
+            value="$(cat "$f" || true)"
+            if test "$value" != "0"; then
+              echo "PRE-VISUAL FAIL: $f exit=$value"
+              failed=1
+            fi
+          done
+
+          if test "$failed" = "1"; then
+            echo "run_visual=false" >> "$GITHUB_OUTPUT"
+            echo "SKIPPED: earlier mandatory gate failed" \
+              | tee ci_artifacts/15e_chromium_visual_audit.txt
+            echo "0" > ci_artifacts/exit_chromium_visual.txt
+          else
+            echo "run_visual=true" >> "$GITHUB_OUTPUT"
+            echo "OK: all mandatory pre-visual gates passed"
+          fi
+
+      - name: Cache Playwright Chromium
+        if: >-
+          always() &&
+          steps.pre_visual.outputs.run_visual == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('extracted/requirements-visual.txt') }}
+
+      - name: Chromium visual audit
+        if: >-
+          always() &&
+          steps.pre_visual.outputs.run_visual == 'true'
+        continue-on-error: true
+        timeout-minutes: 18
+        env:
+          EFHC_E2E_BASE_URL: http://127.0.0.1:3000
+        run: |
+          set +e
+          ec=0
+          server_pid=""
+          visual_marker="$PWD/ci_artifacts/15_visual_started.marker"
+          touch "$visual_marker"
+
+          finish() {
+            if test -n "$server_pid"; then
+              kill "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            fi
+          }
+          trap finish EXIT
+
+          if ! test -f extracted/requirements-visual.txt; then
+            echo "ERROR: extracted/requirements-visual.txt missing" \
+              | tee ci_artifacts/15a_visual_deps.txt
+            ec=1
+          else
+            python -m pip install \
+              -r extracted/requirements-visual.txt \
+              2>&1 | tee ci_artifacts/15a_visual_deps.txt
+            ec=${PIPESTATUS[0]}
+          fi
+
+          if test "$ec" = "0"; then
+            python -m playwright install --with-deps chromium \
+              2>&1 | tee ci_artifacts/15b_chromium_install.txt
+            ec=${PIPESTATUS[0]}
+          fi
+
+          if test "$ec" = "0"; then
+            (
+              cd extracted/frontend
+              npm run start -- --hostname 127.0.0.1 \
+                > ../../ci_artifacts/15c_frontend_server.txt 2>&1
+            ) &
+            server_pid=$!
+
+            python - <<'PYWAIT' \
+              2>&1 | tee ci_artifacts/15d_frontend_ready.txt
+          import time
+          import urllib.request
+
+          url = "http://127.0.0.1:3000/"
+          for attempt in range(1, 46):
+              try:
+                  with urllib.request.urlopen(url, timeout=2) as response:
+                      print(
+                          "OK: frontend ready "
+                          f"attempt={attempt} status={response.status}"
+                      )
+                  break
+              except Exception as exc:
+                  print(
+                      "WAIT: frontend not ready "
+                      f"attempt={attempt} error={exc}"
+                  )
+                  time.sleep(1)
+          else:
+              raise SystemExit("frontend server did not become ready")
+          PYWAIT
+            ec=${PIPESTATUS[0]}
+          fi
+
+          if test "$ec" = "0"; then
+            cd extracted
+            # Жёсткий предел не позволяет одному Chromium-аудиту
+            # удерживать runner более часа. Exit 124 означает timeout.
+            timeout --signal=TERM --kill-after=30s 15m \
+              python ops/frontend/all_pages_route_backed_visual_audit.py \
+                --base-url http://127.0.0.1:3000 \
+              2>&1 | tee ../ci_artifacts/15e_chromium_visual_audit.txt
+            ec=${PIPESTATUS[0]}
+            cd ..
+          fi
+
+          mkdir -p ci_artifacts/15_chromium_evidence
+          evidence_count=0
+          while IFS= read -r -d '' evidence_file; do
+            cp --parents "$evidence_file" \
+              ci_artifacts/15_chromium_evidence
+            evidence_count=$((evidence_count + 1))
+          done < <(
+            find \
+              extracted/reports/generated \
+              extracted/reports/screenshots \
+              -type f -newer "$visual_marker" -print0 \
+              2>/dev/null
+          )
+          echo "visual_evidence_files=$evidence_count" \
+            | tee ci_artifacts/15f_chromium_evidence_count.txt
+
+          if test "$ec" = "0" && test "$evidence_count" = "0"; then
+            echo "ERROR: Chromium audit produced no fresh evidence"
+            ec=87
+          fi
+
+          echo "$ec" > ci_artifacts/exit_chromium_visual.txt
+          exit "$ec"
+
+      - name: Upload CI artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci_artifacts
+          path: ci_artifacts
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Gate summary
+        if: always()
+        run: |
+          failed=0
+          expected=(
+            exit_flake8_critical.txt
+            exit_flake8_full.txt
+            exit_ruff_full.txt
+            exit_mypy_full.txt
+            exit_bandit_full.txt
+            exit_compileall.txt
+            exit_psql_pre.txt
+            exit_alembic_upgrade.txt
+            exit_pytest.txt
+            exit_npm_ci.txt
+            exit_npm_build.txt
+            exit_chromium_visual.txt
+          )
+
+          for name in "${expected[@]}"; do
+            f="ci_artifacts/$name"
+            if ! test -f "$f"; then
+              echo "MISS: $f"
+              failed=1
+              continue
+            fi
+
+            value="$(cat "$f" || true)"
+            if test "$value" != "0"; then
+              echo "FAIL: $f exit=$value"
+              failed=1
+            else
+              echo "OK:   $f exit=$value"
+            fi
+          done
+
+          if test "$failed" = "1"; then
+            echo "ERROR: one or more gate steps failed."
+            exit 1
+          fi
+
+          echo "OK: all gate steps passed."
